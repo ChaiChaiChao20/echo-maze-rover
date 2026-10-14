@@ -1,0 +1,83 @@
+import asyncio
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from ml import telemetry_server
+from ml.telemetry_server import handle_connection, schema_validator
+
+
+VALID_PACKET = {
+    "run_id": "test-run-01",
+    "timestamp": 1,
+    "mode": "learn",
+    "source": "live",
+    "motor": {"left_speed": 0, "right_speed": 0, "duration_ms": 0},
+    "scan": {"angle": 90, "distance_cm": 42.0},
+    "imu": {"accel": [0, 0, 9.81], "gyro": [0, 0, 0]},
+    "ir": None,
+    "temp_c": 25.0,
+}
+
+
+class FakeWebSocket:
+    remote_address = ("127.0.0.1", 9999)
+
+    def __init__(self, messages):
+        self.messages = iter(messages)
+        self.sent = []
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self.messages)
+        except StopIteration as error:
+            raise StopAsyncIteration from error
+
+    async def send(self, message):
+        self.sent.append(json.loads(message))
+
+
+class TelemetryServerTests(unittest.TestCase):
+    def test_valid_packet_is_acknowledged_and_logged(self):
+        websocket = FakeWebSocket([json.dumps(VALID_PACKET)])
+        with tempfile.TemporaryDirectory() as directory:
+            asyncio.run(handle_connection(websocket, Path(directory), schema_validator()))
+            log_file = Path(directory) / "test-run-01.jsonl"
+            logged_packet = json.loads(log_file.read_text(encoding="utf-8"))
+
+        self.assertEqual(websocket.sent, [{"ok": True, "run_id": "test-run-01"}])
+        self.assertEqual(logged_packet["run_id"], "test-run-01")
+        self.assertEqual(logged_packet["sender_ip"], "127.0.0.1")
+        self.assertIn("received_at_utc", logged_packet)
+
+    def test_dashboard_command_is_relayed_to_other_client(self):
+        dashboard = FakeWebSocket([json.dumps({"cmd": "stop", "source": "dashboard"})])
+        esp32 = FakeWebSocket([])
+        telemetry_server.CONNECTED_CLIENTS.add(esp32)
+        try:
+            asyncio.run(handle_connection(dashboard, Path(tempfile.mkdtemp()), schema_validator()))
+        finally:
+            telemetry_server.CONNECTED_CLIENTS.discard(esp32)
+        self.assertEqual(dashboard.sent, [{"ok": True, "cmd": "stop", "delivered_to": 1}])
+        self.assertEqual(esp32.sent, [{"cmd": "stop", "source": "dashboard"}])
+
+    def test_rover_status_is_relayed_without_creating_sensor_log(self):
+        esp32 = FakeWebSocket([json.dumps({
+            "event": "rover_status",
+            "state": "stopped",
+            "reason": "ultrasonic_obstacle",
+            "recommended_action": "clear path",
+        })])
+        dashboard = FakeWebSocket([])
+        telemetry_server.CONNECTED_CLIENTS.add(dashboard)
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                asyncio.run(handle_connection(esp32, Path(directory), schema_validator()))
+            finally:
+                telemetry_server.CONNECTED_CLIENTS.discard(dashboard)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+        self.assertEqual(dashboard.sent[0]["event"], "rover_status")
